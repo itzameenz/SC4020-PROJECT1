@@ -1,0 +1,12 @@
+# raw + processed data (do not commit; fetch with scripts/download_data.py)
+data/*.csv
+data/processed/
+# trained checkpoints
+*.pt
+*.ckpt
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# keep folder structure
+!data/.gitkeep
