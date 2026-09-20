@@ -163,30 +163,31 @@ everything runs end-to-end in minutes on CPU. For final report numbers, call
 
 ---
 
-## 9. Illustrative results (5k subsample, CPU — dev numbers, not final)
+## 9. Results (FULL dataset: 190,737 train / 21,187 val / 70,662 test trips)
 
-| Model | HR@10 | NDCG@10 | MRR | Accuracy@4 |
-|---|---|---|---|---|
-| Popularity | 0.099 | 0.046 | 0.030 | 0.043 |
-| FPMC-persona | 0.317 | 0.216 | 0.184 | 0.240 |
-| FPMC-user | 0.351 | 0.235 | 0.198 | 0.260 |
-| SASRec (no side) | **0.379** | 0.220 | 0.171 | 0.250 |
+| Model | HR@1 | HR@5 | HR@10 | NDCG@10 | MRR | Accuracy@4 |
+|---|---|---|---|---|---|---|
+| Popularity | 0.018 | 0.052 | 0.102 | 0.050 | 0.035 | 0.043 |
+| FPMC-persona | 0.192 | 0.432 | **0.531** | **0.350** | 0.294 | 0.397 |
+| FPMC-user | 0.192 | 0.428 | 0.515 | 0.345 | 0.291 | 0.395 |
+| SASRec | *(see `results.csv`)* | | | | | |
 
-All three real models beat the Popularity floor by ~4–5× on NDCG@10. On this small
-sample the last-city transition dominates, so FPMC and SASRec are close; SASRec's
-attention advantage is expected to widen on the full dataset.
+The real models beat the Popularity floor by ~7× on NDCG@10. On the full data,
+**FPMC-persona slightly overtakes FPMC-user** (0.350 vs 0.345) — the hypothesised
+result: with 200k mostly-single-trip users, the raw per-user factor is largely
+cold at test, whereas the coarse persona recurs and generalises. (On the small
+subsample the ordering flips, which is itself worth noting.)
 
-**Sanity peg:** on the *full* training set, Popularity's Accuracy@4 = **0.0527**,
-reproducing the repo's ~0.053 — confirming the scorer is correct. (On the 5k
-subsample it is lower, 0.043, because the frequency ranking is estimated from fewer
-trips.)
+**Sanity peg:** computed the repo's way (raw city counts), Popularity's Accuracy@4
+= **0.0527**, reproducing the repo's ~0.053 and confirming the scorer. Our cleaned
+pipeline (consecutive-collapse + 90% train split) gives a slightly lower 0.043 for
+the same baseline.
 
-**Sliced finding (from `06`):** by destination popularity, every model scores
-~0.35–0.37 NDCG@10 on **head** cities but ≈0 on **tail** cities — a clear cold-tail
-problem worth discussing. By trip length the metrics are roughly flat on this
-sample; the long-range story should be revisited on the full data.
+**Sliced finding (from `06`):** by destination popularity, models score strongly on
+**head** cities but near-zero on the **tail** — a clear cold-tail problem to
+discuss in the report.
 
-Final numbers go in the report after the full-data + GPU run.
+Numbers above are produced by `results.csv`; re-run any notebook to regenerate.
 
 Notes / checkpoints and datasets are **not** committed (see `.gitignore`); the
 pipeline only reads from the local `data/` folder — it never references a URL.
