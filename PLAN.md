@@ -298,8 +298,8 @@ project1/
     03_markov.ipynb             Popularity + Markov            (Ronia)
     04_fpmc.ipynb               FPMC + persona ablation        (Ameen)
     05_gru4rec.ipynb            GRU4Rec                        (Ronia)
-    05_sasrec.ipynb             SASRec + side-feature ablation (Ameen)
-    06_comparison.ipynb         final table + sliced analyses + plots
+    06_sasrec.ipynb             SASRec + side-feature ablation (Ameen)
+    07_comparison.ipynb         final table + sliced analyses + plots
   src/
     preprocessing.py          SHARED
     evaluate.py               SHARED

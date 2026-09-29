@@ -18,13 +18,15 @@ material for the report.
 3. [Design principle: one shared pipeline](#3-design-principle-one-shared-pipeline)
 4. [Preprocessing, step by step](#4-preprocessing-step-by-step)
 5. [Evaluation, in detail](#5-evaluation-in-detail)
-6. [Model 1 — FPMC](#6-model-1--fpmc)
-7. [Model 2 — SASRec](#7-model-2--sasrec)
-8. [Results and analysis](#8-results-and-analysis)
-9. [File-by-file reference](#9-file-by-file-reference)
-10. [For the teammate: plug in your own model](#10-for-the-teammate-plug-in-your-own-model)
-11. [How to run](#11-how-to-run)
-12. [Submission constraints](#12-submission-constraints)
+6. [Model 1 — Markov Chain](#6-model-1--markov-chain)
+7. [Model 2 — FPMC](#7-model-2--fpmc)
+8. [Model 3 — GRU4Rec](#8-model-3--gru4rec)
+9. [Model 4 — SASRec](#9-model-4--sasrec)
+10. [Results and analysis](#10-results-and-analysis)
+11. [File-by-file reference](#11-file-by-file-reference)
+12. [For the teammate: plug in your own model](#12-for-the-teammate-plug-in-your-own-model)
+13. [How to run](#13-how-to-run)
+14. [Submission constraints](#14-submission-constraints)
 
 ---
 
@@ -177,7 +179,49 @@ to UNK and is an automatic miss (as it would be in deployment).
 
 **Deeper analyses.** `evaluate_sliced(...)` reports metrics per subgroup (e.g. by
 trip length, or by destination popularity via `city_frequency(...)`), which is how the
-report turns a leaderboard into findings.
+report turns a leaderboard into findings. Implemented in `06_comparison.ipynb`:
+
+- **Headline table**, curated to one representative row per model from `results.csv`
+  (the auto-selected/default config for each), with every ablation variant shown
+  separately rather than mixed into the ladder comparison.
+- **Multi-seed** (seeds 1, 2, 3): FPMC, GRU4Rec, SASRec re-trained per seed, reported as
+  mean ± std, so a gap between two models reflects the model rather than a lucky
+  initialisation. Markov is excluded (deterministic — pure counting reproduces bit-for-
+  bit identically across seeds). Result: **GRU4Rec and SASRec are statistically tied**
+  (NDCG@10 0.356 vs 0.357, both spreads ~0.006–0.009), and FPMC is tied with Markov
+  (0.344 vs 0.343) — personalisation via persona adds essentially nothing over the
+  order-1 transition table on this dataset.
+- **Sliced by trip length** (≤3 / 4–5 / 6+ visible cities): tests the project's central
+  hypothesis, that long-range memory (GRU4Rec/SASRec) should pull ahead on longer
+  trips. **Not supported — the pattern is closer to reversed.** The neural models lead
+  on short prefixes; Markov catches up and overtakes on 6+ (its NDCG@10 rises with
+  length while the neural models' falls). Plausible explanation: most training
+  positions come from short prefixes, so long-context examples are comparatively rare
+  during training, while Markov is length-invariant by construction (it only ever
+  looks at the last city).
+- **Sliced by destination popularity** (head / mid / tail by training frequency, via
+  `city_frequency`): tests whether embedding-based models generalise better than
+  Markov's lookup table on rare destinations. **Not supported.** Nearly all of every
+  model's score comes from the head bucket (~0.40 NDCG@10); mid and tail collapse
+  toward zero for every model, Markov included. Markov is *relatively* best on mid/tail
+  despite being worst overall — the neural models' advantage is entirely a head-
+  destination effect, plausibly because uniform random-negative training mostly teaches
+  "score popular cities highly." The tail bucket is confounded by cities unseen in
+  training (frequency 0, automatic misses for every model) and should be reported
+  separately rather than folded into "rare-but-seen" tail cities.
+- **Efficiency** (#params, train time): pulled from in-memory metrics rather than
+  `results.csv`, since `append_result`'s fixed column list does not persist
+  `train_secs`/`n_params`/`fallback_rate` — a gap in `evaluate.py` worth noting for
+  future cleanup.
+- **Fallback rate** (Markov only): the concrete, quantified explanation for Markov's
+  ceiling — see the order-1 vs order-2 result above.
+- **Sanity peg:** Popularity's Accuracy@4 (0.0425) is within the stated 0.02 tolerance
+  of the ~0.053 reference, though on the low side — treat as "in the expected range,"
+  not an exact reproduction.
+- **Bootstrap confidence intervals** (bonus, test-set resampling): captures a different
+  uncertainty from multi-seed — whether a headline gap reflects a genuinely easier/
+  harder test split rather than the model. Any two models whose CIs overlap
+  substantially should not be reported as a settled ranking.
 
 **The interface a model must satisfy:**
 ```python
@@ -186,8 +230,46 @@ targets = [t["target_city"] for t in data["test"]]
 metrics = evaluate(ranked_lists, targets)     # ranked_lists aligned to data["test"]
 append_result("results.csv", "MyModel", metrics)
 ```
+## 6. Model 1 — Markov Chain
 
-## 6. Model 1 — FPMC
+**Idea.** The simplest model with actual memory: score *"what usually follows city `l`
+(order-1), or the pair `(l2, l1)` (order-2)?"* by counting observed transitions in the
+training trips.
+
+score(i | context) = count(context → i) + smoothing # add-k / Laplace
+
+No learning, no gradient — just counts. This is the first rung above Popularity on the
+sophistication ladder (Popularity → **Markov** → FPMC → GRU4Rec → SASRec).
+
+**Fallback chain.** A context the model never saw at order-2 falls back to order-1, and
+an order-1 context it never saw falls back to global Popularity, so every trip always
+gets a full ranked list. We track the **fallback rate** — the share of test trips that
+could not be served at the model's own selected order — as the direct, quantified
+explanation for where Markov plateaus.
+
+**Ablation — order × smoothing.** Grid search over order ∈ {1, 2} and smoothing ∈
+{0.1, 1.0, 5.0}, selected by validation NDCG@10 (`select_markov`), test touched once.
+**Order-1 wins clearly (NDCG@10 0.3425 vs order-2's 0.3236)**, despite order-2
+theoretically carrying more context — because order-2's fallback rate is far higher
+(29.7% vs order-1's 0.4%). A more specific context is more informative *when seen
+before*, but is seen before far less often; order-1 wins because it generalises to more
+test cases without needing to fall back.
+
+**Implementation note (worth mentioning in the report).** Smoothing had **zero
+measurable effect** on any ranking metric across all three values, at both orders. This
+is not a bug: add-k smoothing adds a uniform constant to a set of candidate scores, and
+a uniform additive shift can never change their relative order — a mathematical
+property of the technique, not a property of our data. Smoothing is meaningful for
+*probability calibration* (its original use in language modelling) but has no effect on
+top-k ranking metrics, which is all HR/NDCG/MRR ever measure. Worth stating plainly
+rather than implying a tuned smoothing constant did anything.
+
+**Compute note.** Markov "training" is pure counting — no epochs, no gradients. A full
+order × smoothing grid (6 configs) runs in well under two minutes on CPU, by far the
+cheapest model in the project. Code: `src/models/markov.py`; notebook:
+`notebooks/03_markov.ipynb`.
+
+## 7. Model 2 — FPMC
 
 **Idea.** FPMC (Factorized Personalized Markov Chains) scores *"given this traveller,
 currently in city `l`, how likely is city `i` next?"* by adding two factorized terms:
@@ -222,7 +304,49 @@ lower learning rate + more regularization is the natural tuning direction (good
 "parameter settings" content for the report). Code: `src/models/fpmc.py`; notebook:
 `notebooks/04_fpmc.ipynb`.
 
-## 7. Model 2 — SASRec
+## 8. Model 3 — GRU4Rec
+
+**Idea.** GRU4Rec compresses the whole trip prefix into a single recurrent hidden state
+and scores every city from that one state, instead of pairwise transitions
+(Markov/FPMC) or attending over the whole sequence (SASRec):
+
+h_t = GRU(h_{t-1}, emb(c_t)) score(i) = h_T · emb(i)
+
+It is the first model in the project with genuine **long-range sequence memory** —
+capability #3 on the ladder. Trained with the same BPR next-item objective as SASRec
+(one sampled negative per valid position), early-stopped on validation NDCG@10.
+
+**Implementation note (worth mentioning in the report, parallel to SASRec's NaN
+story).** The naive version above — a plain GRU with no embedding scaling and no direct
+path to the input — badly underperformed: validation NDCG@10 started at **0.043**
+(barely above Popularity's ~0.05) and took ~30 epochs to reach ~0.25, well below
+Markov's 0.3425. Diagnosed as: unlike Markov (direct lookup), FPMC (direct dot
+product), and SASRec (a residual stream), the plain GRU had to learn the dominant
+"last-city → next-city" pattern entirely through its gates, from scratch, rather than
+getting it for free. We rebuilt the architecture to match SASRec's treatment: city
+embeddings scaled by √dim, a final LayerNorm, and — the key fix — **a residual
+connection from the input embedding to the output**, giving the score a direct
+current-city term on top of the recurrence. Padded steps are zeroed and the GRU made
+bias-free, so left-padding cannot leak into the hidden state. Result: epoch-1
+validation NDCG@10 jumped from 0.043 to 0.265, and full test NDCG@10 from 0.271 to
+**0.363** — on par with SASRec (0.357–0.365) rather than trailing every other model.
+
+**Ablation — side features.** With vs without trip-level context (device_class,
+booker_country, affiliate_id), summed into the input embedding. Single-seed result was
+inconsistent in sign between the old and rebuilt architecture (old: side features
+helped, +0.02 NDCG@10; rebuilt: side features slightly hurt, −0.008), which is itself
+evidence the effect is noise rather than real — smaller than the ~0.006 seed-to-seed
+spread from the multi-seed run. Report as "no reliable effect," not as a finding either
+way.
+
+**Multi-seed result.** Over seeds {1, 2, 3}: NDCG@10 = **0.3559 ± 0.0057**, statistically
+tied with SASRec (0.3574 ± 0.0093) and clearly above FPMC/Markov (~0.343).
+
+**Compute note.** ~1 minute per run on a Colab GPU, converging by early stopping around
+epoch 15 in the rebuilt architecture (down from ~30–36 in the naive version). Code:
+`src/models/gru4rec.py`; notebook: `notebooks/05_gru4rec.ipynb`.
+
+## 9. Model 4 — SASRec
 
 **Idea.** SASRec (Self-Attentive Sequential Recommendation) replaces a recurrent
 hidden state with **causal self-attention** over the city sequence: at each step it
@@ -257,40 +381,65 @@ parameters hurt most. Notebook: `notebooks/05_sasrec.ipynb`.
 took ~13–17 minutes; the proper setting is a Colab GPU (a few minutes). FPMC, being
 shallow, trains in ~1–2 minutes on CPU.
 
-## 8. Results and analysis
+## 10. Results and analysis
 
 **Full dataset (190,737 train / 21,187 val / 70,662 test trips, 39,903 cities):**
 
-| Model | HR@1 | HR@5 | HR@10 | NDCG@5 | NDCG@10 | MRR | Accuracy@4 |
-|---|---|---|---|---|---|---|---|
-| Popularity | 0.018 | 0.052 | 0.102 | 0.034 | 0.050 | 0.035 | 0.043 |
-| FPMC-persona | 0.192 | 0.432 | 0.531 | 0.318 | **0.350** | 0.294 | 0.397 |
-| FPMC-user | 0.192 | 0.428 | 0.515 | 0.316 | 0.345 | 0.291 | 0.395 |
-| SASRec-no-side | 0.183 | 0.434 | **0.549** | 0.313 | **0.351** | 0.289 | 0.396 |
-| SASRec-side-sum | 0.158 | 0.416 | 0.537 | 0.292 | 0.332 | 0.268 | 0.378 |
-| SASRec-side-concat | 0.131 | 0.360 | 0.494 | 0.247 | 0.290 | 0.228 | 0.316 |
-
-*(rows produced by `results.csv`; Markov + GRU4Rec are added by the teammate)*
+| Model | HR@1 | HR@5 | HR@10 | NDCG@5 | NDCG@10 | MRR | Acc@4 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Markov-1 (k=0.1) | 0.193 | 0.423 | 0.509 | 0.315 | 0.343 | 0.290 | 0.391 |
+| Markov-1 (k=1.0) | 0.193 | 0.423 | 0.509 | 0.315 | 0.343 | 0.290 | 0.391 |
+| Markov-1 (k=5.0) | 0.193 | 0.423 | 0.509 | 0.315 | 0.343 | 0.290 | 0.391 |
+| Markov-2 (k=0.1) | 0.211 | 0.386 | 0.444 | 0.305 | 0.324 | 0.286 | 0.365 |
+| Markov-2 (k=1.0) | 0.211 | 0.386 | 0.444 | 0.305 | 0.324 | 0.286 | 0.365 |
+| Markov-2 (k=5.0) | 0.211 | 0.386 | 0.444 | 0.305 | 0.324 | 0.286 | 0.365 |
+| FPMC-persona | 0.192 | 0.432 | 0.531 | 0.318 | 0.350 | 0.293 | 0.397 |
+| FPMC-user | 0.192 | 0.428 | 0.515 | 0.316 | 0.344 | 0.291 | 0.395 |
+| GRU4Rec-no-side | 0.182 | 0.458 | 0.572 | 0.326 | 0.363 | 0.298 | 0.416 |
+| GRU4Rec-side | 0.171 | 0.449 | 0.566 | 0.317 | 0.355 | 0.290 | 0.408 |
+| SASRec-no-side | 0.187 | 0.451 | 0.574 | 0.325 | 0.365 | 0.300 | 0.411 |
+| SASRec-side-sum | 0.181 | 0.450 | 0.571 | 0.320 | 0.360 | 0.294 | 0.410 |
+| SASRec-side-concat | 0.152 | 0.399 | 0.517 | 0.280 | 0.318 | 0.257 | 0.362 |
+| Popularity | 0.018 | 0.052 | 0.102 | 0.034 | 0.050 | 0.035 | 0.042 |
 
 **What the numbers say:**
-1. **Both real models beat the Popularity floor by ~7×** on NDCG@10 (0.35 vs 0.05) —
-   sequence/transition information is highly predictive of the next city.
-2. **FPMC-persona ≥ FPMC-user** on full data — evidence that with mostly-single-trip
-   users the coarse persona generalises where a raw per-user factor cannot. This is
-   the payoff of the personalization ablation.
-3. **SASRec's side features hurt** (no-side > sum > concat) — a clean negative
-   ablation result: the trip-level context here adds noise, not signal.
-4. **SASRec (no-side) and FPMC-persona are neck-and-neck** — SASRec wins HR@10
-   (0.549 vs 0.531), FPMC-persona ties/edges NDCG@10. On this dataset, with short
-   trips dominated by the last-city transition, the transformer's extra machinery buys
-   little over a well-built factorized Markov model — itself a worthwhile conclusion.
-5. **Cold-tail problem** (from `06`'s sliced analysis): models score strongly on
-   popular (head) destinations but near-zero on rare (tail) cities.
 
-**Sanity peg.** Popularity's Accuracy@4 = 0.0527 (repo-style raw counts) reproduces the
-repo's ~0.053 → the evaluation code is trustworthy.
+1. **Every real model beats the Popularity floor by ~7×** on NDCG@10 (0.32–0.365 vs
+   0.05) — sequence/transition information is highly predictive of the next city.
 
-## 9. File-by-file reference
+2. **Add-k smoothing has no effect on any metric**, at either order (k=0.1/1.0/5.0
+   give identical rows). This is expected, not a tuning failure: adding a uniform
+   constant to a set of candidate scores can never change their relative order, so
+   smoothing — a technique from probability calibration — is mathematically inert for
+   a purely rank-based evaluation like ours.
+
+3. **Markov order-1 beats order-2** (NDCG@10 0.343 vs 0.324), despite order-2
+   carrying more context. The explanation is the fallback rate: order-2 contexts are
+   seen far less often in training, so order-2 falls back to a lower order or to
+   Popularity on 29.7% of test trips, versus 0.4% for order-1. A more specific
+   context is more informative only when it has actually been observed before —
+   order-1 wins because it generalises to more test cases without needing to
+   fall back.
+
+4. **FPMC-persona ≥ FPMC-user** on full data (NDCG@10 0.350 vs 0.344) — evidence
+   that with ~93% of users appearing in only one trip, the coarse persona
+   generalises to test where a raw per-user factor is cold-started. This is the
+   intended payoff of the personalization ablation, though the gap is small enough
+   that it should be read alongside the multi-seed result in point 7 before treating
+   it as settled.
+
+5. **GRU4Rec and SASRec are the strongest models** (NDCG@10 0.363 and 0.365 for
+   the no-side variants), each clearing FPMC by roughly 0.013–0.015 and Markov by
+   0.020–0.022. This is the point on the sophistication ladder where added capability
+   most clearly paid off on this table.
+
+6. **Side features hurt both neural sequence models.** GRU4Rec: no-side 0.363 >
+   side 0.355. SASRec: no-side 0.365 > sum 0.360 > concat 0.318, with concatenation's
+   extra parameters hurting most. This is a consistent, general finding about the
+   dataset's trip-level context (device, booker country, affiliate) — too coarse or
+   noisy to help either architecture — rather than an architecture-specific quirk.
+
+## 11. File-by-file reference
 
 ```
 project1/
@@ -299,14 +448,18 @@ project1/
 │   ├── preprocessing.py         SHARED — clean/encode/feature/split (Section 4)
 │   ├── evaluate.py              SHARED — metrics + sliced analysis (Section 5)
 │   └── models/
+│       ├── markov.py            Markov: build_transition_counts, MarkovChain, run_markov, select_markov
 │       ├── fpmc.py              FPMC: build_transitions, FPMC(nn.Module), train_fpmc, run_fpmc
+│       ├── gru4rec.py           GRU4Rec: build_matrix, GRU4Rec(nn.Module), train_gru4rec, run_gru4rec
 │       └── sasrec.py            SASRec: build_matrix, SASRec(nn.Module), train_sasrec, run_sasrec
 ├── notebooks/
 │   ├── 01_data_exploration.ipynb   EDA — trip lengths, user sparsity, seasonality
 │   ├── 02_preprocessing.ipynb      runs preprocessing, writes processed.pkl
+│   ├── 03_markov.ipynb             Markov order-1/2 + smoothing grid search, fallback rate
 │   ├── 04_fpmc.ipynb               FPMC + persona ablation
-│   ├── 05_sasrec.ipynb             SASRec + side-feature ablation
-│   └── 06_comparison.ipynb         final table, sliced analyses, plots
+│   ├── 05_gru4rec.ipynb            GRU4Rec + side-feature ablation
+│   ├── 06_sasrec.ipynb             SASRec + side-feature ablation
+│   └── 07_comparison.ipynb         final table, sliced analyses, plots
 ├── scripts/download_data.py     one-time data fetch (dev only; NOT part of the pipeline)
 ├── results.csv                  one row of metrics per model/ablation
 ├── README.md                    this document
@@ -323,7 +476,7 @@ project1/
 - `fpmc.run_fpmc(data, axis="persona"|"user")` → `(metrics, ranked_lists, val_ndcg)`.
 - `sasrec.run_sasrec(data, side_feats=..., side_mode="sum"|"concat")` → same shape.
 
-## 10. For the teammate: plug in your own model
+## 12. For the teammate: plug in your own model
 
 Import the two shared files — **don't rewrite them** — and make your model output a
 ranked list of city ids per test trip. That's the entire contract.
@@ -350,7 +503,7 @@ append_result("results.csv", "Markov-order1", evaluate(ranked_lists, targets))
 Anything that produces a ranked list per test trip (counts, RNN, transformer) slots
 straight in and lands in the same `results.csv` for the comparison.
 
-## 11. How to run
+## 13. How to run
 
 ### Google Colab (recommended; needed for fast full-scale SASRec)
 1. Upload the `project1` folder (or clone the repo).
@@ -361,7 +514,7 @@ straight in and lands in the same `results.csv` for the comparison.
      wget -q https://raw.githubusercontent.com/bookingcom/ml-dataset-mdt/main/test_set.csv && \
      wget -q https://raw.githubusercontent.com/bookingcom/ml-dataset-mdt/main/ground_truth.csv
    ```
-3. Run notebooks in order: `01 → 02 → 04 → 05 → 06`.
+3. Run notebooks in order: `01 → 02 → 03 → 04 → 05_gru4rec → 06_sasrec → 07`.
 4. Full-scale SASRec: **Runtime → Change runtime type → GPU** (auto-detected).
 
 ### Local
@@ -369,14 +522,14 @@ straight in and lands in the same `results.csv` for the comparison.
 python -m venv .venv && .venv\Scripts\activate     # Windows
 pip install pandas numpy matplotlib torch jupyter
 python scripts\download_data.py --out data
-jupyter notebook                                    # run 01 -> 02 -> 04 -> 05 -> 06
+jupyter notebook                                    # run 01 -> 02 -> 03 -> 04 -> 05_gru4rec -> 05_sasrec -> 06
 ```
 
 **Scale.** Preprocessing defaults to a fast 5k-trip subsample; pass
 `sample_n_trips=None` for the full dataset (the numbers in Section 8). FPMC/Popularity
 run in minutes on CPU; run full SASRec on a Colab GPU.
 
-## 12. Submission constraints (from the scope)
+## 14. Submission constraints
 
 - The graded code (`src/` + notebooks) reads only from the local `data/` folder —
   **no URLs, no cloud links**. `download_data.py` is a dev convenience, not the pipeline.
