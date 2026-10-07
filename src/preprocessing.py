@@ -34,6 +34,10 @@ Pipeline (each step is explained in report-ready prose in the notebooks):
     Validation lets FPMC/SASRec be tuned and early-stopped without ever touching
     test.
 
+For the FINAL fit (benchmark protocol step 3) `merge_train_val(data)` folds the
+validation trips back into train: it restores each leave-last-out trip to its
+full sequence, so the final models train on train + validation.
+
 Output: one dict (also pickled) with keys train / valid / test / encoders /
 persona_encoder / n_cities / meta. Every model reads its slice from this.
 Padding and per-model training-example construction live inside each MODEL, not
@@ -266,6 +270,53 @@ def _to_leave_last_out(trip: dict) -> Optional[dict]:
     return out
 
 
+def _restore_full_trip(v: dict) -> dict:
+    """Undo `_to_leave_last_out`: put the hidden last city back on a validation trip.
+
+    The target city is appended to `cities`; the last step's month / length of
+    stay come back from `query`. `hotel_country` of that last step was not kept
+    by the leave-last-out split, so it is filled with UNK (no model that merges
+    train+val -- Markov, GRU4Rec -- reads it). Position features are recomputed.
+    """
+    out = dict(v)
+    n = len(v["cities"]) + 1
+    idx, frac, bucket = _position_features(n)
+    out["cities"] = v["cities"] + [v["target_city"]]
+    out["hotel_country"] = v["hotel_country"] + [UNK]
+    out["month"] = v["month"] + [v["query"]["month"]]
+    out["los"] = v["los"] + [v["query"]["los"]]
+    out["pos_index"] = idx.tolist()
+    out["pos_frac"] = [round(f, 4) for f in frac.tolist()]
+    out["pos_bucket"] = bucket.tolist()
+    out["query"] = None
+    out.pop("target_city", None)
+    return out
+
+
+def merge_train_val(data: dict) -> dict:
+    """Return a copy of `data` whose "train" is train + validation (full trips).
+
+    Used for the FINAL fit of every model (benchmark protocol step 3): after
+    hyper-parameters and the epoch count are chosen on validation, the models are
+    refit on train + validation and scored once on test.
+
+    * Each validation trip (prefix + hidden last city) is restored to a full
+      trip identical in format to a train trip.
+    * "valid" is set to [] in the returned dict so nothing can accidentally be
+      scored on data the model has trained on. "test" is untouched.
+    * The input dict is not modified.
+    """
+    merged = dict(data)
+    restored = [_restore_full_trip(v) for v in data["valid"]]
+    merged["train"] = list(data["train"]) + restored
+    merged["valid"] = []
+    merged["meta"] = {**data["meta"],
+                      "merged_train_val": True,
+                      "n_train_trips": len(merged["train"]),
+                      "n_valid_trips": 0}
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Top-level pipeline
 # ---------------------------------------------------------------------------
@@ -429,4 +480,17 @@ if __name__ == "__main__":
     assert t["target_city"] >= N_RESERVED, "target 40 was in train -> real id >= 2"
     assert min(min(x["cities"]) for x in out["train"]) >= N_RESERVED, \
         "real city ids must start at 2 (0=PAD,1=UNK)"
+    # --- merge_train_val: leave-last-out trips come back as full trips -------
+    full = next(t for t in out["train"] if t["utrip_id"] == "A_1")
+    val = _to_leave_last_out(full)
+    fake = {**out, "valid": [val], "meta": dict(out["meta"])}
+    m = merge_train_val(fake)
+    back = m["train"][-1]
+    assert back["cities"] == full["cities"], "restored valid trip != original"
+    assert back["month"] == full["month"] and back["los"] == full["los"]
+    assert back["pos_index"] == full["pos_index"] and back["query"] is None
+    assert "target_city" not in back and m["valid"] == []
+    assert len(m["train"]) == len(out["train"]) + 1 and len(fake["train"]) == len(out["train"])
+    assert m["test"] is fake["test"], "test must be untouched"
+    print("merge_train_val OK")
     print("ALL SMOKE-TEST ASSERTIONS PASSED")
