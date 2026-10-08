@@ -1,0 +1,20 @@
+{
+  "Markov": {
+    "recursive": true,
+    "best_params": {
+      "max_order": 3,
+      "mu": 41.38313631541885
+    },
+    "best_val_NDCG@10": 0.41277086116435435,
+    "n_trials": 25
+  },
+  "Markov (no recursion)": {
+    "recursive": false,
+    "best_params": {
+      "max_order": 1,
+      "mu": 0.42070539502879356
+    },
+    "best_val_NDCG@10": 0.39012175794857523,
+    "n_trials": 25
+  }
+}
