@@ -1,0 +1,14 @@
+{
+  "best_params": {
+    "lr": 0.0002981158737685572,
+    "weight_decay": 5.2209890824242905e-05,
+    "dropout": 0.11501455023567547,
+    "embed_dim": 256,
+    "num_blocks": 2,
+    "batch_size": 256,
+    "max_len": 30
+  },
+  "E_best": 5,
+  "best_val_NDCG@10": 0.4652191378924161,
+  "n_trials": 25
+}
