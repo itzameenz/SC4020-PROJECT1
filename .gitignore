@@ -10,5 +10,6 @@ __pycache__/
 .ipynb_checkpoints/
 # keep folder structure
 !data/.gitkeep
-# local run logs
+# local env + run logs
+.venv/
 run.log
