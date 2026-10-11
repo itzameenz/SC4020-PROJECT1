@@ -208,6 +208,94 @@ def append_result(path: str, model: str, metrics: Dict[str, float]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reading results.csv back (mean rows + "<model> (std)" rows)
+# ---------------------------------------------------------------------------
+
+STD_SUFFIX = " (std)"
+
+
+def load_results(path: str):
+    """Read results.csv and split it into (means, stds) DataFrames indexed by model.
+
+    The benchmark protocol logs, per stochastic model, a mean row ("SASRec-no-side")
+    and a spread row ("SASRec-no-side (std)", 5-seed sample std). Deterministic
+    models (Markov) and any model whose std row has not been added yet simply have
+    no std row: they get NaN in `stds` rather than raising.
+
+    If a row was logged more than once, the LAST one wins (re-runs overwrite).
+    """
+    import pandas as pd
+    df = pd.read_csv(path).drop_duplicates("model", keep="last").set_index("model")
+    is_std = df.index.str.endswith(STD_SUFFIX)
+    means = df[~is_std]
+    stds = df[is_std].copy()
+    stds.index = stds.index.str[: -len(STD_SUFFIX)]
+    stds = stds.reindex(means.index)           # NaN where no std row exists
+    return means, stds
+
+
+# ---------------------------------------------------------------------------
+# Fast bootstrap over test trips (evaluation uncertainty)
+# ---------------------------------------------------------------------------
+
+def target_ranks(ranked_lists, targets, kmax: int = 10) -> np.ndarray:
+    """1-based rank of the true city within the top-`kmax` of each list (0 = miss).
+    Same PAD/UNK rule as `evaluate`. Computed once, so bootstrapping is cheap."""
+    ranks = np.zeros(len(targets), dtype=np.int32)
+    for i, (ranked, tgt) in enumerate(zip(ranked_lists, targets)):
+        if tgt in RESERVED:
+            continue
+        for j, c in enumerate(ranked[:kmax]):
+            if c == tgt:
+                ranks[i] = j + 1
+                break
+    return ranks
+
+
+def metric_from_ranks(ranks: np.ndarray, metric: str = "NDCG@10") -> float:
+    """HR@k / NDCG@k / MRR from `target_ranks` output (matches `evaluate`)."""
+    hit = ranks > 0
+    if metric == "MRR":
+        return float(np.where(hit, 1.0 / np.maximum(ranks, 1), 0.0).mean())
+    kind, k = metric.split("@")
+    k = int(k)
+    inside = hit & (ranks <= k)
+    if kind == "HR":
+        return float(inside.mean())
+    if kind == "NDCG":
+        return float(np.where(inside, 1.0 / np.log2(np.maximum(ranks, 1) + 1.0), 0.0).mean())
+    raise ValueError(f"unsupported metric {metric!r}")
+
+
+def bootstrap_ci(ranked_lists, targets, metric: str = "NDCG@10",
+                 n_boot: int = 1000, seed: int = 0, alpha: float = 0.05):
+    """Percentile bootstrap CI over TEST TRIPS for one model.
+    Returns (mean, (lo, hi)). Vectorised: ~1000 resamples take a second or two."""
+    ranks = target_ranks(ranked_lists, targets)
+    rng = np.random.default_rng(seed)
+    n = len(ranks)
+    vals = np.array([metric_from_ranks(ranks[rng.integers(0, n, n)], metric)
+                     for _ in range(n_boot)])
+    return float(vals.mean()), tuple(np.percentile(vals, [100 * alpha / 2, 100 * (1 - alpha / 2)]))
+
+
+def paired_bootstrap_diff(ranked_a, ranked_b, targets, metric: str = "NDCG@10",
+                          n_boot: int = 1000, seed: int = 0, alpha: float = 0.05):
+    """Paired bootstrap of metric(A) - metric(B): the SAME resampled trips score
+    both models, which is much tighter than comparing two separate CIs.
+    Returns (observed_diff, (lo, hi)); a CI excluding 0 = the gap is not test-set noise."""
+    ra, rb = target_ranks(ranked_a, targets), target_ranks(ranked_b, targets)
+    rng = np.random.default_rng(seed)
+    n = len(ra)
+    diffs = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n, n)
+        diffs[i] = metric_from_ranks(ra[idx], metric) - metric_from_ranks(rb[idx], metric)
+    obs = metric_from_ranks(ra, metric) - metric_from_ranks(rb, metric)
+    return obs, tuple(np.percentile(diffs, [100 * alpha / 2, 100 * (1 - alpha / 2)]))
+
+
+# ---------------------------------------------------------------------------
 # Smoke test:  python -m src.evaluate
 # ---------------------------------------------------------------------------
 
@@ -235,4 +323,13 @@ if __name__ == "__main__":
                        [0.3, 0.0, 0.8, 0.4]])
     tk = topk_from_scores(scores, k=2, exclude=(0,))
     assert list(tk[0]) == [1, 2] and list(tk[1]) == [2, 3]
+
+    # fast-bootstrap helpers must agree with evaluate()
+    rk = target_ranks(ranked, targets)
+    for met in ("HR@1", "HR@5", "NDCG@5", "MRR"):
+        assert abs(metric_from_ranks(rk, met) - m[met]) < 1e-9, met
+    mean_, (lo_, hi_) = bootstrap_ci(ranked, targets, "HR@5", n_boot=50)
+    assert lo_ <= mean_ <= hi_
+    d_, (dlo, dhi) = paired_bootstrap_diff(ranked, ranked, targets, n_boot=20)
+    assert d_ == 0 and dlo == 0 and dhi == 0
     print("ALL SMOKE-TEST ASSERTIONS PASSED")
